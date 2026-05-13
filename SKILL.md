@@ -1,6 +1,6 @@
 ---
 name: coreclaw
-description: Run CoreClaw scrapers and retrieve structured results using the CoreClaw REST API with curl. Use when the user wants to scrape websites, collect data from supported platforms, run a CoreClaw scraper, monitor runs, fetch results, export data, or debug a failed run.
+description: Reusable CoreClaw workflow for AI agents. Use it to discover a scraper, read the live input schema, run jobs in sync or async mode, poll status, fetch results, export data, inspect logs, rerun jobs, or debug failed runs.
 homepage: https://coreclaw.com
 metadata:
   openclaw:
@@ -15,21 +15,91 @@ metadata:
 
 # CoreClaw
 
-Run scrapers on [CoreClaw Store](https://coreclaw.com/store) and retrieve structured results via the REST API.
+Run scrapers from [CoreClaw Store](https://coreclaw.com/store) and retrieve structured results through the CoreClaw REST API.
 
-Full OpenAPI spec: [openapi.json](openapi.json)
+Canonical API reference: [openapi.json](openapi.json)
+Chinese repository guide: [README.zh-CN.md](README.zh-CN.md)
 
-## Authentication
+## When this skill should trigger
 
-Most endpoints need the `CORECLAW_API_KEY` env var. Use it as an `api-key` header:
+Use this skill when the user wants to:
+
+- search CoreClaw Store for a suitable scraper
+- inspect a scraper's live parameters or README
+- start a scraper run in sync or async mode
+- monitor an existing `run_slug`
+- fetch paginated results for analysis
+- export results as CSV or JSON
+- inspect logs, rerun a job, abort a run, or review history
+- debug why a CoreClaw run failed
+
+## Authentication and base URL
+
+Base URL: `https://openapi.coreclaw.com`
+
+Most endpoints require the `CORECLAW_API_KEY` env var as the `api-key` header:
 
 ```bash
 -H "api-key: $CORECLAW_API_KEY"
 ```
 
-Base URL: `https://openapi.coreclaw.com`
+Public endpoints that do not require an API key:
 
-**Public endpoints** (no API key needed): `/api/store` (search scrapers), `/api/scraper` (scraper detail).
+- `GET /api/store`
+- `GET /api/scraper`
+
+## Runtime precedence
+
+If runtime behavior conflicts with older examples or repository text, trust current runtime behavior first.
+
+Priority order:
+
+1. live runtime behavior
+2. current platform docs
+3. this repository's `openapi.json`
+4. examples in `SKILL.md` and `README`
+
+## Verified behavior snapshot
+
+Verified during the 2026-05 regression pass:
+
+- `scraper/run` accepts `is_async=false` without `callback_url`
+- `scraper/run` also accepted `is_async=true` without `callback_url`
+- if webhook orchestration is needed, `callback_url` should still be passed explicitly
+- `rerun` rejected missing `callback_url` with `4000 Invalid request parameters`
+- `abort` has a documented request/response contract, but successful abort conditions still need more runtime evidence
+- different scrapers expose different `custom` schemas and must be treated dynamically
+
+## Hard rules
+
+1. Always read `GET /api/scraper?slug=...` before constructing a `scraper/run` request.
+2. Never guess `version`; always use `data.version` from `/api/scraper`.
+3. Never hardcode the shape of `input.parameters.custom`; always derive it from `data.parameters.custom` returned by `/api/scraper`.
+4. Treat `input.parameters.system` as the stable platform layer, and `input.parameters.custom` as the scraper-specific layer.
+5. Prefer `result/list` for small inline analysis and `result/export` for large datasets or file delivery.
+6. When runtime and older examples disagree, explain the difference and follow runtime.
+
+## Schema handling rules
+
+1. Treat `data.parameters.custom` from `GET /api/scraper?slug=...` as the live schema descriptor.
+2. Treat `input.parameters.custom` in `scraper/run` as the actual request payload derived from that descriptor.
+3. Never hardcode scraper-specific field names such as `startURLs`, `keyword`, `url`, or nested item keys unless the live descriptor returned them for the current scraper.
+4. When `custom` contains arrays, nested objects, or repeated item schemas, map the live shape first and only then fill the minimal required values.
+5. If the live schema is unclear, stop and re-read `/api/scraper` instead of guessing.
+
+## Maintenance note
+
+Before publishing or revising any example in `README.md`, `README.zh-CN.md`, or `SKILL.md`, verify the example against a live scraper detail response and keep the example tied to the observed schema shape. If a new scraper family is added, record the observed pattern in `REGRESSION.md` so future updates stay reproducible.
+
+## Quick decision guide
+
+- Need a scraper candidate -> use `/api/store`
+- Need the real request shape -> use `/api/scraper`
+- Need small inline analysis -> use `result/list`
+- Need a file or large dataset -> use `result/export`
+- Need failure reason -> use `run/detail` first, then `run/last/log`
+- Need async webhook orchestration -> pass `callback_url`
+- Need a rerun -> pass `callback_url`
 
 ## Core workflow
 
@@ -41,33 +111,42 @@ Search the CoreClaw Store by keyword:
 curl -s "https://openapi.coreclaw.com/api/store?search=amazon&limit=5" | jq '.data.scraper[] | {slug, title, description}'
 ```
 
-Response returns `data.scraper[]` with `slug`, `title`, `description` for each match.
+What to extract:
 
-- `search`: search keyword (required, use `""` for all)
-- `limit`: max number of results to return (required)
+- `slug`
+- `title`
+- `description`
 
-### 2. Get scraper detail and input schema
+### 2. Read the live scraper contract
 
-Before running a scraper, fetch its parameter schema and README:
+Before any run, read the scraper detail:
 
 ```bash
 curl -s "https://openapi.coreclaw.com/api/scraper?slug=SCRAPER_SLUG" | jq '.data | {version, parameters, readme}'
 ```
 
-The response includes:
-- `data.version` — the current version string (e.g. `"v1.0.2"`). **Use this value when running the scraper.**
-- `data.parameters.system` — default system resource settings (cpus, memory_bytes, execute_limit_time_seconds)
-- `data.parameters.custom` — scraper-specific input fields. Read `custom.properties[]` to see each field's `name`, `type`, `title`, `editor`, `default`, `required`, and `description`.
-- `data.parameters.custom.b` — the primary input field name (e.g. `"startURLs"`)
-- `data.readme` — usage documentation for the scraper
+Use the response as the live contract source:
 
-### 3. Run a scraper (async)
+- `data.version` -> required in `scraper/run`
+- `data.parameters.system` -> default system values
+- `data.parameters.custom` -> live schema for scraper-specific input fields
+- `data.readme` -> human-readable scraper instructions
 
-Start a scraper and get the `run_slug` back immediately. **`version`, `system`, `custom` parameters must all come from Step 2** (scraper detail response):
+Important mapping rule:
 
-- `version` → `data.version`
-- `system` → use `data.parameters.system` defaults (cpus, memory_bytes, execute_limit_time_seconds, etc.)
-- `custom` → read `data.parameters.custom.properties[]` to see each scraper's specific input fields, then fill in accordingly
+- `/api/scraper` may expose `memory_bytes`
+- `/api/v1/scraper/run` uses `memory`
+- these refer to the same MB value
+
+### 3. Choose run mode
+
+#### Option A: synchronous run
+
+Use sync mode when the user wants a simple request/response flow and is willing to wait.
+
+- set `is_async` to `false`
+- `callback_url` is optional
+- use the smallest valid live `custom` payload first when validating a new scraper
 
 ```bash
 curl -s -X POST "https://openapi.coreclaw.com/api/v1/scraper/run" \
@@ -75,18 +154,53 @@ curl -s -X POST "https://openapi.coreclaw.com/api/v1/scraper/run" \
   -H "Content-Type: application/json" \
   -d '{
     "scraper_slug": "SCRAPER_SLUG",
-    "version": "VERSION_FROM_STEP_2",
+    "version": "VERSION_FROM_DETAIL",
+    "is_async": false,
     "input": {
       "parameters": {
         "system": {
-          "cpus": <from Step 2: data.parameters.system.cpus>,
-          "memory": <from Step 2: data.parameters.system.memory_bytes>,
-          "execute_limit_time_seconds": <from Step 2: data.parameters.system.execute_limit_time_seconds>,
+          "cpus": 0.125,
+          "memory": 512,
+          "execute_limit_time_seconds": 1800,
           "max_total_charge": 0,
           "max_total_traffic": 0
         },
         "custom": {
-          <fields from Step 2: data.parameters.custom.properties[]>
+          "START_WITH_THE_MINIMAL_VALID_LIVE_PAYLOAD": true
+        }
+      }
+    }
+  }'
+```
+
+#### Option B: asynchronous run
+
+Use async mode when the user wants background execution, status polling, or webhook-based orchestration.
+
+- set `is_async` to `true`
+- if webhook orchestration is needed, pass `callback_url`
+- current runtime accepted missing `callback_url` during the 2026-05 verification pass
+
+```bash
+curl -s -X POST "https://openapi.coreclaw.com/api/v1/scraper/run" \
+  -H "api-key: $CORECLAW_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "scraper_slug": "SCRAPER_SLUG",
+    "version": "VERSION_FROM_DETAIL",
+    "is_async": true,
+    "input": {
+      "parameters": {
+        "system": {
+          "cpus": 0.125,
+          "memory": 512,
+          "execute_limit_time_seconds": 1800,
+          "max_total_charge": 0,
+          "max_total_traffic": 0,
+          "proxy_region": "US"
+        },
+        "custom": {
+          "START_WITH_THE_MINIMAL_VALID_LIVE_PAYLOAD": true
         }
       }
     },
@@ -94,15 +208,11 @@ curl -s -X POST "https://openapi.coreclaw.com/api/v1/scraper/run" \
   }'
 ```
 
-Response: `{"code": 0, "message": "success", "data": {"run_slug": "01KKDXV2G26BT7NH4ZQR2R4NPZ"}}`
+Response returns `data.run_slug`. Save it for all later operations.
 
-Save the `run_slug` — you need it for all subsequent operations.
+### 4. Poll run status safely
 
-**Important**: `callback_url` is required. Use a valid callback endpoint such as `"https://your-callback.example.com/webhook"` when you need async notifications.
-
-### 4. Poll run status
-
-Check run status until it reaches a terminal state. **Always use the robust polling pattern below** to avoid infinite loops when the API returns unexpected responses:
+Use `POST /api/v1/run/detail` to monitor progress:
 
 ```bash
 CONSECUTIVE_ERRORS=0
@@ -111,74 +221,65 @@ while true; do
     -H "api-key: $CORECLAW_API_KEY" \
     -H "Content-Type: application/json" \
     -d '{"run_slug": "RUN_SLUG"}')
-  # Sanitize control characters before passing to jq
+
   RESP_CLEAN=$(echo "$RESP" | tr -d '\000-\011\013-\037')
   STATUS=$(echo "$RESP_CLEAN" | jq -r '.data.status // empty' 2>/dev/null)
+
   if [ -z "$STATUS" ]; then
     CONSECUTIVE_ERRORS=$((CONSECUTIVE_ERRORS + 1))
-    ERR_CODE=$(echo "$RESP_CLEAN" | jq -r '.code // empty' 2>/dev/null)
-    echo "$(date +%H:%M:%S) - Parse error or empty status (errors: $CONSECUTIVE_ERRORS, code: $ERR_CODE)"
     if [ "$CONSECUTIVE_ERRORS" -ge 5 ]; then
-      echo "ERROR: 5 consecutive failures. Raw response:"
+      echo "ERROR: 5 consecutive failures"
       echo "$RESP" | head -c 500
       break
     fi
     sleep 10
     continue
   fi
+
   CONSECUTIVE_ERRORS=0
-  echo "$(date +%H:%M:%S) - Status: $STATUS"
+  echo "Status: $STATUS"
+
   case "$STATUS" in
-    3) echo "$RESP_CLEAN" | jq '.data | {status, results, duration, usage}'; break;;
-    4) echo "$RESP_CLEAN" | jq '.data | {status, err_msg, duration, usage}'; break;;
+    3) echo "$RESP_CLEAN" | jq '.data | {status, results, duration, usage}'; break ;;
+    4) echo "$RESP_CLEAN" | jq '.data | {status, err_msg, duration, usage}'; break ;;
   esac
+
   sleep 10
 done
 ```
 
 Status codes:
 
-| Code | State | Terminal? |
-|------|-------|-----------|
-| 1 | Ready | No |
-| 2 | Running | No |
-| 3 | Succeeded | Yes |
-| 4 | Failed | Yes |
-| 5 | Aborting | No |
+- `1` ready
+- `2` running
+- `3` succeeded
+- `4` failed
+- `5` aborting
 
-Response also includes: `scraper_title`, `scraper_slug`, `usage` (cost), `started_at`, `finished_at`, `duration` (seconds), `traffic` (bytes), `version`, `origin` (api/web).
+### 5. Retrieve results
 
-**Polling safeguards:**
-- `tr -d '\000-\011\013-\037'` strips control characters that break jq parsing
-- `CONSECUTIVE_ERRORS` counter breaks after 5 consecutive parse/API failures,并打印原始响应便于调试
-- `jq -r '.data.status // empty' 2>/dev/null` safely handles missing fields
+#### Inline analysis: `result/list`
 
-### 5. Get results
-
-There are **two ways** to retrieve results. Choose based on the scenario:
-
-| Scenario | Use | Why |
-|----------|-----|-----|
-| Preview data, show to user, analyze inline | `result/list` | Returns JSON directly — AI can read and process it |
-| User asks to save/download, or data is large | `result/export` | Returns a download URL for CSV/JSON file |
-
-**Option A: Paginated inline data (`result/list`)** — preferred for AI analysis
+Use this for small datasets and when the agent needs to inspect data directly.
 
 ```bash
 curl -s -X POST "https://openapi.coreclaw.com/api/v1/run/result/list" \
   -H "api-key: $CORECLAW_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"run_slug": "RUN_SLUG", "page": 1, "page_size": 20}'
+  -d '{"run_slug": "RUN_SLUG", "page_index": 1, "page_size": 20}'
 ```
 
-Response includes:
-- `data.count` — total number of result records
-- `data.headers[]` — column definitions with `label`, `key`, `format`
-- `data.list[]` — the actual data records (each record also contains a `__coreclaw_data_id__`)
+What to read:
 
-First call with `page_size: 20` to check `data.count`. If the user needs all data and count is large (>100), switch to export. Otherwise paginate through with `page: 2, 3, ...`.
+- `data.count`
+- `data.headers[]`
+- `data.list[]`
 
-**Option B: File export (`result/export`)** — preferred for saving to disk
+The fields inside `data.list[]` are not fixed. They depend on the Worker output schema.
+
+#### File delivery: `result/export`
+
+Use this for large datasets or when the user wants a file.
 
 ```bash
 curl -s -X POST "https://openapi.coreclaw.com/api/v1/run/result/export" \
@@ -187,28 +288,16 @@ curl -s -X POST "https://openapi.coreclaw.com/api/v1/run/result/export" \
   -d '{"run_slug": "RUN_SLUG", "format": "csv", "filter_keys": []}'
 ```
 
-- `format`: `"csv"` or `"json"`
-- `filter_keys`: array of field key names to export. Use `[]` for all fields.
+The response returns a temporary `download_url`, not raw records.
 
-Response returns a temporary download URL (valid ~30 min), not raw data:
+### 6. Saved tasks and reruns
 
-```json
-{"code": 0, "message": "success", "data": {"download_url": "https://..."}}
-```
+#### Run a saved task
 
-Then download the file:
+`POST /api/v1/task/run` launches a saved Task template.
 
-```bash
-DL_URL=$(curl -s -X POST "https://openapi.coreclaw.com/api/v1/run/result/export" \
-  -H "api-key: $CORECLAW_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"run_slug": "RUN_SLUG", "format": "csv", "filter_keys": []}' | jq -r '.data.download_url')
-curl -L -o results.csv "$DL_URL"
-```
-
-### 6. Run a saved task
-
-Tasks are pre-configured scraper runs saved in the CoreClaw console. Run one by its `task_slug`:
+- `task_slug` required
+- `callback_url` required by documented contract
 
 ```bash
 curl -s -X POST "https://openapi.coreclaw.com/api/v1/task/run" \
@@ -217,11 +306,12 @@ curl -s -X POST "https://openapi.coreclaw.com/api/v1/task/run" \
   -d '{"task_slug": "TASK_SLUG", "callback_url": "https://your-callback.example.com/webhook"}'
 ```
 
-Returns a `run_slug` in the response — use it to poll status and fetch results as usual.
+#### Re-run an existing run
 
-### 7. Re-run a previous job
+`POST /api/v1/rerun` starts a new async run using the same parameters as a previous run.
 
-Re-run using the same parameters from a previous run:
+- `run_slug` required
+- `callback_url` required and verified by runtime behavior
 
 ```bash
 curl -s -X POST "https://openapi.coreclaw.com/api/v1/rerun" \
@@ -230,11 +320,9 @@ curl -s -X POST "https://openapi.coreclaw.com/api/v1/rerun" \
   -d '{"run_slug": "PREVIOUS_RUN_SLUG", "callback_url": "https://your-callback.example.com/webhook"}'
 ```
 
-Returns a new `run_slug` for the re-run.
+### 7. Debugging tools
 
-### 8. View run logs
-
-Get logs for a run to debug issues:
+#### View logs
 
 ```bash
 curl -s -X POST "https://openapi.coreclaw.com/api/v1/run/last/log" \
@@ -243,22 +331,13 @@ curl -s -X POST "https://openapi.coreclaw.com/api/v1/run/last/log" \
   -d '{"run_slug": "RUN_SLUG"}' | jq '.data.list[] | {type, group, content, timestamp}'
 ```
 
-Log type codes:
+#### Abort a running task
 
-| Code | Level |
-|------|-------|
-| 1 | Debug |
-| 2 | Info |
-| 3 | Warn |
-| 4 | Error |
+`POST /api/v1/scraper/abort` aborts a running Worker task.
 
-Response also includes:
-- `data.all_logs_url` — URL to download the full log file
-- `data.result_count` — total number of scraped records
-
-### 9. Abort a run
-
-Stop a running scraper:
+- send `run_slug` in the JSON body
+- success response is `{"code":0,"message":"success","data":null}`
+- if abort fails, capture both `run/detail` before/after and the raw abort response
 
 ```bash
 curl -s -X POST "https://openapi.coreclaw.com/api/v1/scraper/abort" \
@@ -267,9 +346,7 @@ curl -s -X POST "https://openapi.coreclaw.com/api/v1/scraper/abort" \
   -d '{"run_slug": "RUN_SLUG"}'
 ```
 
-### 10. Check account info
-
-Check your balance and traffic usage:
+#### Check account info
 
 ```bash
 curl -s -X POST "https://openapi.coreclaw.com/api/v1/account/info" \
@@ -278,191 +355,89 @@ curl -s -X POST "https://openapi.coreclaw.com/api/v1/account/info" \
   -d '{}' | jq '.data | {balance, traffic, traffic_expiration_at}'
 ```
 
-Returns:
-- `balance` — account balance (string, e.g. `"10122.5547"`)
-- `traffic` — traffic used in bytes
-- `traffic_expiration_at` — Unix timestamp when traffic expires
+## Decision guide
 
-## Quick recipes
+### When to use `result/list`
 
-### Scrape and get results (full async workflow)
+Use it when:
 
-```bash
-# 1. Search for a scraper
-SLUG=$(curl -s "https://openapi.coreclaw.com/api/store?search=amazon&limit=1" \
-  | jq -r '.data.scraper[0].slug')
+- the user wants a quick preview
+- the dataset is small enough to fit in context
+- the agent needs to summarize or transform records inline
 
-# 2. Get scraper detail — extract version, system defaults, and custom field schema
-DETAIL=$(curl -s "https://openapi.coreclaw.com/api/scraper?slug=$SLUG")
-VERSION=$(echo "$DETAIL" | jq -r '.data.version')
-CPUS=$(echo "$DETAIL" | jq -r '.data.parameters.system.cpus')
-MEMORY=$(echo "$DETAIL" | jq -r '.data.parameters.system.memory_bytes')
-TIMEOUT=$(echo "$DETAIL" | jq -r '.data.parameters.system.execute_limit_time_seconds')
-# Check data.parameters.custom.properties[] for scraper-specific input fields
+### When to use `result/export`
 
-# 3. Start the run (use values from Step 2, customize "custom" per scraper)
-RUN=$(curl -s -X POST "https://openapi.coreclaw.com/api/v1/scraper/run" \
-  -H "api-key: $CORECLAW_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "scraper_slug": "'"$SLUG"'",
-    "version": "'"$VERSION"'",
-    "input": {
-      "parameters": {
-        "system": {
-          "cpus": '"$CPUS"',
-          "memory": '"$MEMORY"',
-          "execute_limit_time_seconds": '"$TIMEOUT"',
-          "max_total_charge": 0,
-          "max_total_traffic": 0
-        },
-        "custom": {
-          "startURLs": [{"url": "https://example.com"}],
-          "proxy_region": "US"
-        }
-      }
-    },
-    "callback_url": "https://your-callback.example.com/webhook"
-  }')
-RUN_SLUG=$(echo "$RUN" | jq -r '.data.run_slug')
-echo "Started run: $RUN_SLUG"
+Use it when:
 
-# 4. Poll until done (with safeguards)
-CONSECUTIVE_ERRORS=0
-while true; do
-  RESP=$(curl -s -X POST "https://openapi.coreclaw.com/api/v1/run/detail" \
-    -H "api-key: $CORECLAW_API_KEY" \
-    -H "Content-Type: application/json" \
-    -d '{"run_slug": "'"$RUN_SLUG"'"}')
-  RESP_CLEAN=$(echo "$RESP" | tr -d '\000-\011\013-\037')
-  STATUS=$(echo "$RESP_CLEAN" | jq -r '.data.status // empty' 2>/dev/null)
-  if [ -z "$STATUS" ]; then
-    CONSECUTIVE_ERRORS=$((CONSECUTIVE_ERRORS + 1))
-    echo "Parse error (errors: $CONSECUTIVE_ERRORS)"
-    if [ "$CONSECUTIVE_ERRORS" -ge 5 ]; then echo "Too many errors"; break; fi
-    sleep 10; continue
-  fi
-  CONSECUTIVE_ERRORS=0; echo "Status: $STATUS"
-  case "$STATUS" in 3|4) break;; esac
-  sleep 5
-done
+- the user asks for a file
+- the dataset is large
+- a clean CSV or JSON artifact is needed outside the chat context
 
-# 5. Check result count
-RESULT=$(curl -s -X POST "https://openapi.coreclaw.com/api/v1/run/result/list" \
-  -H "api-key: $CORECLAW_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"run_slug": "'"$RUN_SLUG"'", "page": 1, "page_size": 20}')
-COUNT=$(echo "$RESULT" | jq '.data.count')
-echo "Total results: $COUNT"
+## Common failure patterns
 
-# 6a. Small dataset (≤100) — read inline for analysis
-echo "$RESULT" | jq '.data.list'
+### `4000 Invalid request parameters`
 
-# 6b. Large dataset (>100) — export to file
-DL_URL=$(curl -s -X POST "https://openapi.coreclaw.com/api/v1/run/result/export" \
-  -H "api-key: $CORECLAW_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"run_slug": "'"$RUN_SLUG"'", "format": "json", "filter_keys": []}' | jq -r '.data.download_url')
-curl -L -o results.json "$DL_URL"
-```
+Usually means one of these:
 
-### Run a saved task
+- `version` was guessed instead of read from `/api/scraper`
+- `input.parameters.custom` does not match the live scraper schema
+- sync/async fields are inconsistent
+- `rerun` or `task/run` was called without `callback_url`
+- `abort` was attempted when the platform did not accept the current task state
 
-```bash
-curl -s -X POST "https://openapi.coreclaw.com/api/v1/task/run" \
-  -H "api-key: $CORECLAW_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"task_slug": "TASK_SLUG", "callback_url": "https://your-callback.example.com/webhook"}'
-```
+### Empty or confusing results
 
-### Debug a failed run
+Check:
 
-```bash
-# 1. Check run detail
-curl -s -X POST "https://openapi.coreclaw.com/api/v1/run/detail" \
-  -H "api-key: $CORECLAW_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"run_slug": "RUN_SLUG"}' | jq '.data | {status, err_msg, duration, usage}'
+- whether the run actually succeeded
+- whether the user only needs page 1 or all pages
+- whether export is more appropriate than inline listing
 
-# 2. Get logs (filter for errors)
-curl -s -X POST "https://openapi.coreclaw.com/api/v1/run/last/log" \
-  -H "api-key: $CORECLAW_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"run_slug": "RUN_SLUG"}' | jq '.data.list[] | select(.type == 4) | {content, timestamp}'
-```
+### Polling loops forever
 
-## Run history
+Check:
 
-List past runs with pagination and optional filters:
+- parsing errors caused by control characters
+- repeated non-JSON responses
+- whether terminal states `3` or `4` are being handled correctly
 
-```bash
-curl -s -X POST "https://openapi.coreclaw.com/api/v1/run/list" \
-  -H "api-key: $CORECLAW_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"page": 1, "page_size": 20, "status": 0, "scraper_slug": ""}'
-```
+## Verified coverage and known gaps
 
-- `status`: `0` = all, `1` = ready, `2` = running, `3` = succeeded, `4` = failed, `5` = aborting
-- `scraper_slug`: filter by scraper slug, or `""` for all scrapers
+Verified by runtime:
 
-Response: `data.count` (total), `data.list[]` with `slug`, `status`, `scraper_title`, `scraper_slug`, `results`, `usage`, `started_at`, `finished_at`, `duration`, `origin`, `traffic`, `version`.
+- store discovery
+- scraper detail and live schema reads
+- async run with callback
+- async run without callback
+- run detail
+- run list
+- result list
+- result export
+- run logs
+- rerun with callback
+- account info
 
-## Error handling
+Known gaps:
 
-All responses use a standard envelope: `{"code": <int>, "message": "<string>", "data": <object|null>}`.
+- sync mode still needs a single stable minimal success example that is easy to replay
+- abort needs a stronger positive example under a platform state that definitely supports cancellation
+- `task/run` is still documented here according to platform docs but not independently verified in this repo's regression pass
 
-`code: 0` means success. Non-zero codes indicate errors:
+## Minimal acceptance checklist
 
-| Code | Meaning |
-|------|---------|
-| 4000 | Invalid request parameters |
-| 4010 | Unauthorized access / task does not belong to you |
-| 4040 | Resource not found |
-| 4290 | Rate limited |
-| 5000 | Internal server error |
-| 10001 | User not found / unavailable |
-| 10002 | User disabled |
-| 20001 | Invalid API key |
-| 20002 | API key expired |
-| 30001 | Insufficient balance |
-| 30002 | Insufficient traffic |
-| 50001 | Script not found |
-| 50002 | Script run failed |
-| 50003 | Script version unavailable |
-| 60001 | Task not found |
-| 70001 | Run record does not exist |
-| 70002 | Abort run failed |
+A correct agent using this skill should consistently do the following:
 
-HTTP status codes:
-- **400**: bad request — check required fields and parameter types.
-- **401**: `CORECLAW_API_KEY` is missing, invalid, or expired.
-- **404**: scraper, run, or task not found — verify the slug.
-- **429**: too many requests — back off and retry.
-- **5xx**: server error — retry with backoff.
-
-## System parameter reference
-
-When running a scraper via `/v1/scraper/run`, the `input.parameters.system` object controls resource allocation:
-
-| Parameter | Type | Options / Range | Description |
-|-----------|------|-----------------|-------------|
-| `cpus` | number | 0.125, 0.25, 0.5, 1.0, 2.0, 4.0 | CPU cores allocated |
-| `memory` | integer | 512, 1024, 2048, 4096, 8192, 16384 | Memory in MB |
-| `execute_limit_time_seconds` | integer | e.g. 1800 | Timeout in seconds |
-| `max_total_charge` | integer | 0 = unlimited | Max cost cap in USD |
-| `max_total_traffic` | integer | 0 = unlimited | Max traffic cap in MB |
-
-The `input.parameters.custom` object contains scraper-specific fields. Common fields:
-- `startURLs` — array of `{"url": "..."}` objects
-- `proxy_region` — ISO 3166-1 alpha-2 country code (e.g. `"US"`, `"GB"`, `"JP"`)
-
-Always fetch the scraper detail first (`GET /api/scraper?slug=...`) to see the exact custom fields, types, and defaults for the specific scraper you want to run.
-
-## Proxy region codes
-
-The `proxy_region` field in `input.parameters.custom` accepts ISO 3166-1 alpha-2 country codes. Common examples: `US`, `GB`, `JP`, `DE`, `FR`, `CN`, `BR`, `IN`, `AU`, `KR`.
+1. discover a scraper with `/api/store` or accept a provided slug
+2. fetch `/api/scraper` before calling `scraper/run`
+3. copy `version` from the detail response
+4. derive `custom` from the live schema instead of guessing field names
+5. choose sync vs async correctly
+6. decide whether to send `callback_url` in async mode based on runtime behavior and webhook needs
+7. use `run_slug` for follow-up operations
+8. choose `result/list` vs `result/export` according to dataset size and user intent
+9. use logs or `run/detail` for debugging instead of hallucinating causes
 
 ## Additional resources
 
 - OpenAPI spec: [openapi.json](openapi.json)
-- CoreClaw Store (browse scrapers): https://coreclaw.com/store
+- CoreClaw Store: https://coreclaw.com/store
